@@ -225,8 +225,22 @@ export type ModelCatalogEntry = {
   providerID: string
   modelID: string
   providerName?: string
+  /**
+   * opencode's display name for the model, read from the user's config
+   * (`provider.<id>.models.<id>.name`). Absent when opencode reports none,
+   * in which case the host falls back to the prettified id.
+   */
+  name?: string
   /** Effort/thinking variant keys in the provider's declared order. */
   variants: string[]
+  /** The model declares reasoning support (`capabilities.reasoning`). */
+  reasoning?: boolean
+  /** Token limits opencode reports for the model. */
+  limit?: {
+    context?: number
+    input?: number
+    output?: number
+  }
   /**
    * Last variant the user picked for this model (per-model memory, held in
    * host preferences). Re-selecting the model restores it, so a model
@@ -246,6 +260,12 @@ export type ModelCatalogInfo = {
   models: ModelCatalogEntry[]
   /** `providerID/modelID` keys, most recently used first. */
   recents: string[]
+  /**
+   * `providerID/modelID` keys the user starred in the picker. Rendered as a
+   * pinned "Favorites" section at the top of the browse list. Persisted
+   * host-side and rides the catalog push like `recents`.
+   */
+  favorites?: string[]
   /**
    * Provider IDs whose picker group the user folded. Persisted host-side
    * and rides the catalog push like `recents`.
@@ -559,6 +579,15 @@ export type Inbound =
   | { type: "send"; text: string; mentions?: string[]; attachments?: Attachment[]; conversationMentions?: ConversationMention[] }
   | { type: "runCommand"; command: string; arguments: string }
   | { type: "editMessage"; id: string; text: string; mentions?: string[]; attachments?: Attachment[]; conversationMentions?: ConversationMention[] }
+  /**
+   * Revert the conversation to an earlier user message (per-message Undo in
+   * the chat UI). `id` is the webview-side message id; the host resolves it
+   * to the opencode message id and runs the same revert + truncate flow as
+   * `/undo`, restoring the undone prompt to the composer.
+   */
+  | { type: "revertToMessage"; id: string }
+  /** Re-apply the most recently reverted turn (UI equivalent of `/redo`). */
+  | { type: "redoTurn" }
   | { type: "abort" }
   | { type: "createConversation" }
   | { type: "openConversation"; id: string }
@@ -596,6 +625,8 @@ export type Inbound =
   | { type: "refreshModels" }
   /** Fold/unfold a provider group in the model picker (persisted host-side). */
   | { type: "setProviderCollapsed"; providerID: string; collapsed: boolean }
+  /** Star/unstar a model in the picker (`providerID/modelID` key, persisted host-side). */
+  | { type: "toggleModelFavorite"; key: string }
   | { type: "fileSearch"; requestID: number; query: string }
   | { type: "listDir"; requestID: number; path: string }
   | { type: "attachFile"; requestID: number }

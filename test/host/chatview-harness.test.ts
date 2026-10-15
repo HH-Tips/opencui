@@ -130,6 +130,8 @@ beforeEach(async () => {
     variantFor: () => undefined,
     setModel: vi.fn(async () => {}),
     setAgent: vi.fn(async () => {}),
+    favoriteModels: () => [] as string[],
+    toggleModelFavorite: vi.fn(async () => {}),
     collapsedProviders: () => [...foldedProviders],
     setProviderCollapsed: vi.fn(async (id: string, collapsed: boolean) => {
       const idx = foldedProviders.indexOf(id)
@@ -688,6 +690,13 @@ describe("ChatView harness: attachment storage", () => {
     const workspaceState = makeMemento()
     await workspaceState.update(CONVERSATIONS_KEY, seed)
     await workspaceState.update(ACTIVE_CONVERSATION_KEY, seed[0]!.id)
+    // These tests exercise the restore path, so opt into last-session
+    // restore (the default startup is the home view).
+    const getConfiguration = vi.mocked(vscode.workspace.getConfiguration)
+    const prevImpl = getConfiguration.getMockImplementation()
+    getConfiguration.mockImplementation(
+      (() => ({ get: (key: string, def?: unknown) => (key === "chat.restoreLastSession" ? true : def) })) as never,
+    )
     const context = {
       workspaceState,
       globalState: makeMemento(),
@@ -710,6 +719,7 @@ describe("ChatView harness: attachment storage", () => {
       indexManager,
       new AgentTaskStore(makeMemento() as unknown as vscode.Memento),
     )
+    getConfiguration.mockImplementation(prevImpl ?? ((() => ({ get: vi.fn() })) as never))
     const fake = makeFakeWebviewView()
     await chatView.resolveWebviewView(fake.view)
     return { chatView, posted: fake.posted, send: fake.send, disposeView: fake.disposeView, workspaceState }
@@ -1207,6 +1217,7 @@ describe("ChatView harness: model catalog", () => {
         },
       ],
       recents: [],
+      favorites: [],
       collapsedProviders: [],
       agents: [{ name: "default" }],
     })
@@ -1253,6 +1264,20 @@ describe("ChatView harness: model catalog", () => {
     // All-undefined = reset to the opencode default.
     await harness.send({ type: "setModel" })
     expect(setModel).toHaveBeenLastCalledWith(undefined, undefined, undefined)
+  })
+
+  it("toggleModelFavorite persists via prefs and re-pushes the catalog", async () => {
+    server.setProviders([GPT_PROVIDER])
+    await harness.send({ type: "mounted" })
+    await until(() => catalogs().length > 0)
+    const before = catalogs().length
+    const toggleModelFavorite = vi.mocked(harness.prefs.toggleModelFavorite)
+
+    await harness.send({ type: "toggleModelFavorite", key: "openai/gpt-5.5" })
+    expect(toggleModelFavorite).toHaveBeenCalledWith("openai/gpt-5.5")
+    // Unlike folds, favorite changes re-push the catalog so the picker can
+    // move the row into/out of the Favorites section.
+    await until(() => catalogs().length > before)
   })
 
   it("the catalog carries user-selectable agents only; setAgent persists via prefs", async () => {

@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-10-15
+
+### Added
+
+- Per-message revert/restore in the chat UI: each settled user bubble gains a revert button (`MessageView`), wired through `revertToMessage`/`redoTurn` in `protocol.ts` and `ChatView` (`revertToMessage`, `redoTurn`, `revertLastTurn`, `redoViaCommand`), with palette commands `opencui.conversation.undo`/`redo`, header undo/redo buttons, and `backfillUserBackendIDs` healing for turns that predate backendID association. Includes the `takePromptUserMessage` 2.0 adapter hook, the TUI chat fix in `backend/v2/api.ts`, and the legacy agent display-name normalization (`Build`/`Plan`) in `preferences.ts`.
+- Model catalog information surface: provider/model metadata table, model display name, favorites (persisted in `preferences.ts`, toggled from `ModelPicker`/`ModelHovercard`), and an expandable info panel at the bottom of the model dropdown (`ModelHovercard.tsx`, `ModelPicker.tsx`, `StatusBar.tsx`, `picker.ts`, `backend/v2/map.ts`).
+- Home view with recent sessions (`RecentSessions.tsx`, `App.tsx`, `useChatState.ts`): the panel opens on home with the composer at the bottom, plus the `opencui.chat.restoreLastSession` setting to restore the last open chat on startup instead.
+
 ## [1.16.1] - 2026-10-14
 
 ### Fixed

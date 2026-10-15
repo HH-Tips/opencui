@@ -39,7 +39,7 @@ import { BUILTIN_COMMAND_NAMES, withBuiltinCommands } from "./builtin-commands"
 import { BuiltinRunners } from "./builtin-runners"
 import { readContextUsage } from "./context-usage"
 import { adoptStorageIDs, migrateConversationsToWorkspace } from "./conversation-store"
-import { MAX_EXTERNAL_SESSIONS, externalSessionSummaries, importedMessages, type SessionInfo } from "./import-session"
+import { MAX_EXTERNAL_SESSIONS, backfillUserBackendIDs, externalSessionSummaries, importedMessages, type ServerMessageItem, type SessionInfo } from "./import-session"
 import { PermissionRuleStore } from "./permission-rules"
 import { ConversationManager } from "./conversation-manager"
 import { ContinuationState, isContinuationToast } from "./continuation-state"
@@ -256,11 +256,33 @@ export class ChatView implements vscode.WebviewViewProvider {
       applyActiveSnapshot: () => this.applyActiveSnapshot(),
       refreshContextUsage: (backend) => this.refreshContextUsage(backend),
     })
-    this.applyActiveSnapshot()
+    this.applyStartupSnapshot()
     void this.manager.persist()
     if (this.taskStore) {
       this.taskStoreUnsub = this.taskStore.onDidChange((tasks) => this.postAgentsStatus(tasks))
     }
+  }
+
+  /**
+   * Initial snapshot for the panel. By default the panel opens on the home
+   * view (recent sessions + bottom composer) instead of restoring the last
+   * chat; `opencui.chat.restoreLastSession` opts back into the old behavior.
+   * Home is an untouched empty conversation (no backend session bound), so a
+   * prompt sent from home lands in a new session by default through the
+   * existing lazy `createSessionForSend` path.
+   */
+  private applyStartupSnapshot() {
+    let restore = false
+    try {
+      restore = vscode.workspace.getConfiguration("opencui").get<boolean>("chat.restoreLastSession", false) === true
+    } catch {
+      restore = false
+    }
+    if (!restore) {
+      const { conversation } = this.manager.addOrReuseEmpty("New conversation")
+      this.manager.setActiveID(conversation.id)
+    }
+    this.applyActiveSnapshot()
   }
 
   /**
@@ -731,6 +753,11 @@ export class ChatView implements vscode.WebviewViewProvider {
     this.applyActiveSnapshot()
     await this.inflateActiveAttachments()
     await this.manager.flushPersist()
+    // Heal pre-fix turns before the restore post so the healed ids ride it.
+    // Never cold-starts the backend for this — the undo paths backfill
+    // on demand once a backend is ensured.
+    const entryBackend = this.servers.currentBackend()
+    if (entryBackend) await this.backfillBackendIDs(entryBackend)
     this.sendConversationState()
     this.post({ type: "contextUsage", usage: undefined })
     if (this.sessionID) void this.refreshContextUsage()
@@ -1165,6 +1192,7 @@ export class ChatView implements vscode.WebviewViewProvider {
       (providerID, modelID) => this.prefs.variantFor(providerID, modelID),
       this.modelCatalogAgents ?? [],
       this.prefs.collapsedProviders(),
+      this.prefs.favoriteModels(),
     )
     this.post({ type: "modelCatalog", catalog })
   }
@@ -1338,6 +1366,9 @@ export class ChatView implements vscode.WebviewViewProvider {
           void this.refreshModelCatalog(backend)
           void this.refreshExternalSessions(backend)
           if (this.sessionID) void this.refreshContextUsage(backend)
+          // Heal pre-fix turns on startup too (selectConversation only runs
+          // on switches, not on the initial load).
+          if (this.sessionID) void this.backfillBackendIDs(backend)
         } catch (e) {
           this.post({ type: "connected", connected: false, error: (e as Error).message })
         }
@@ -1352,6 +1383,12 @@ export class ChatView implements vscode.WebviewViewProvider {
         return
       case "editMessage":
         await this.handleEdit(msg.id, msg.text, msg.mentions, msg.attachments, msg.conversationMentions)
+        return
+      case "revertToMessage":
+        await this.revertToMessage(msg.id)
+        return
+      case "redoTurn":
+        await this.redoTurn()
         return
       case "fileSearch":
         try {
@@ -1460,6 +1497,13 @@ export class ChatView implements vscode.WebviewViewProvider {
         // No catalog re-push: the picker folds optimistically, and an echo
         // would reset its keyboard position mid-interaction.
         await this.prefs.setProviderCollapsed(msg.providerID, msg.collapsed)
+        return
+      case "toggleModelFavorite":
+        // Re-push the catalog: favorites change the section ordering, so the
+        // picker needs the echo to move the row into/out of the Favorites
+        // section (unlike folds, which only touch visibility).
+        await this.prefs.toggleModelFavorite(msg.key)
+        this.postModelCatalog()
         return
       case "permissionReply": {
         const perm = this.activePermissions.get(msg.id)
@@ -1931,6 +1975,18 @@ export class ChatView implements vscode.WebviewViewProvider {
       log("prompt call threw", e)
       this.failSend((e as Error).message || "Could not reach the opencode server.")
     }
+    // 2.0 answers the prompt with the created user message, so the pending
+    // bubble resolves here; 1.x reports it over SSE, which clears the same
+    // pending id in onUserMessage. Either way the bubble gains the opencode
+    // message id the rewind features (undo/redo/edit) key on.
+    if (this.pendingUserBackendID) {
+      const targetID = this.pendingUserBackendID
+      const messageID = backend.api.session.takePromptUserMessage?.(this.sessionID)
+      if (messageID) {
+        this.pendingUserBackendID = undefined
+        this.post({ type: "userMessageBackendID", id: targetID, backendID: messageID })
+      }
+    }
     // No further UI action here — the SSE subscription owns assistant lifecycle.
   }
 
@@ -2100,6 +2156,9 @@ export class ChatView implements vscode.WebviewViewProvider {
       this.post({ type: "connected", connected: false, error: (e as Error).message })
       return
     }
+    // Undo on a conversation whose turns predate backendID association would
+    // otherwise report "nothing to undo" — heal the ids first.
+    if (command === "undo") await this.backfillBackendIDs(backend)
     await this.builtinRunners.run(command, backend)
   }
 
@@ -2162,6 +2221,84 @@ export class ChatView implements vscode.WebviewViewProvider {
     }
 
     await this.handleSend(trimmed, mentions, attachments, conversationMentions)
+  }
+
+  /**
+   * Per-message Undo from the chat UI: revert the session to the given user
+   * message (same revert + truncate flow as `/undo`, with the undone prompt
+   * restored to the composer). No-ops with an info message when the target
+   * is not a settled user turn.
+   */
+  private async revertToMessage(webviewID: string) {
+    let backend: Backend
+    try {
+      backend = await this.servers.ensure()
+    } catch (e) {
+      this.post({ type: "connected", connected: false, error: (e as Error).message })
+      return
+    }
+    await this.backfillBackendIDs(backend)
+    await this.builtinRunners.revertToMessage(webviewID, backend)
+  }
+
+  /** UI equivalent of `/redo` — re-apply the most recently reverted turn. */
+  private async redoTurn() {
+    let backend: Backend
+    try {
+      backend = await this.servers.ensure()
+    } catch (e) {
+      this.post({ type: "connected", connected: false, error: (e as Error).message })
+      return
+    }
+    await this.builtinRunners.redoTurn(backend)
+  }
+
+  /** Palette equivalent of `/undo` — revert the last settled turn. */
+  async revertLastTurn() {
+    let backend: Backend
+    try {
+      backend = await this.servers.ensure()
+    } catch (e) {
+      this.post({ type: "connected", connected: false, error: (e as Error).message })
+      return
+    }
+    await this.backfillBackendIDs(backend)
+    await this.builtinRunners.undoLastTurn(backend)
+  }
+
+  /** Palette equivalent of `/redo`. */
+  async redoViaCommand() {
+    return this.redoTurn()
+  }
+
+  /**
+   * Heal user bubbles that predate backendID association (2.0 never reported
+   * them over SSE, so turns sent before the takePromptUserMessage fix carry
+   * none and the rewind features see "nothing to undo"). Matches them against
+   * the server's user messages by exact prompt text — ambiguous bubbles stay
+   * untouched. Best-effort: failures just leave the gaps for the next attempt.
+   */
+  private async backfillBackendIDs(backend: Backend): Promise<void> {
+    if (!this.sessionID || !this.messages.some((m) => m.role === "user" && !m.backendID)) return
+    let items: ServerMessageItem[]
+    try {
+      const res = await backend.api.session.messages(this.sessionID)
+      if (res.error || !res.data) return
+      items = res.data as ServerMessageItem[]
+    } catch (e) {
+      log("backfill backendIDs: messages fetch failed", e)
+      return
+    }
+    const assignments = backfillUserBackendIDs(this.messages, items)
+    if (!assignments.length) return
+    const byID = new Map(assignments.map((a) => [a.id, a.backendID] as const))
+    this.messages = this.messages.map((m) => {
+      const backendID = byID.get(m.id)
+      return backendID ? { ...m, backendID } : m
+    })
+    this.saveActive()
+    this.sendConversationState()
+    log(`backfill backendIDs: healed ${assignments.length} turn(s)`)
   }
 
   private lastStreamReattachAt = 0
