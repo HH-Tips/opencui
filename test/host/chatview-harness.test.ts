@@ -1280,6 +1280,48 @@ describe("ChatView harness: model catalog", () => {
     await until(() => catalogs().length > before)
   })
 
+  it("posts agents + /<agent> commands autonomously when the provider list is empty", async () => {
+    // No picker is ever opened here (no `refreshModels`): the mount
+    // handshake alone must populate agents and slash entries, even when
+    // the provider fetch yields nothing.
+    server.setProviders([])
+    server.setAgents([{ name: "build", mode: "primary", description: "makes changes" }])
+    await harness.send({ type: "mounted" })
+    await until(() =>
+      catalogs().some(
+        (m) => m.type === "modelCatalog" && m.catalog.agents.some((a) => a.name === "build"),
+      ),
+    )
+    const last = catalogs().at(-1)!
+    expect(last.type === "modelCatalog" && last.catalog.models).toEqual([])
+    await until(() =>
+      harness.posted.some(
+        (m) =>
+          m.type === "commands" &&
+          m.commands.some((c) => c.name === "build" && c.agentSwitch),
+      ),
+    )
+    // An empty model list counts as "not loaded": an autonomous retry must
+    // be armed so no picker open is ever needed to populate the list.
+    expect(
+      (harness.chatView as unknown as { catalogRetryTimer?: unknown }).catalogRetryTimer,
+    ).not.toBeUndefined()
+  })
+
+  it("arms no retry once the model list loaded", async () => {
+    server.setProviders([
+      { id: "openai", name: "OpenAI", models: { "gpt-5.5": {} } },
+    ])
+    await harness.send({ type: "mounted" })
+    await until(() =>
+      catalogs().some(
+        (m) => m.type === "modelCatalog" && m.catalog.models.length > 0,
+      ),
+    )
+    expect(
+      (harness.chatView as unknown as { catalogRetryTimer?: unknown }).catalogRetryTimer,
+    ).toBeUndefined()
+  })
   it("the catalog carries user-selectable agents only; setAgent persists via prefs", async () => {
     // Deliberately unsorted: the catalog must come back alphabetical, not in
     // the server's config-discovery order.

@@ -322,7 +322,15 @@ export type DirEntry = { name: string; path: string; kind: "file" | "folder" }
  * (they open native pickers or switch conversations), so the composer lets
  * them through the busy block that swallows turn-bound commands.
  */
-export type CommandInfo = { name: string; description?: string; agent?: string; takesArguments: boolean; allowedWhileBusy?: boolean }
+export type CommandInfo = { name: string; description?: string; agent?: string; takesArguments: boolean; allowedWhileBusy?: boolean; /**
+   * True when this entry is a synthesized `/<agent>` switcher (not a real
+   * opencode command). The webview intercepts it locally: switch the agent
+   * selection and send any trailing args as a normal prompt, so @-mentions,
+   * attachments and queueing keep working. The host keeps the same flag as
+   * a fallback router when its agent list is fresher than the webview's.
+   * Custom commands shadow same-named agents, so the flag is only set when
+   * no custom/built-in claimed the name.
+   */ agentSwitch?: boolean }
 
 /**
  * Status snapshot of the optional semantic index — Phase 6 of the
@@ -577,7 +585,14 @@ export type Outbound =
 export type Inbound =
   | { type: "mounted" }
   | { type: "send"; text: string; mentions?: string[]; attachments?: Attachment[]; conversationMentions?: ConversationMention[] }
-  | { type: "runCommand"; command: string; arguments: string }
+  /**
+   * Run a slash command. For synthesized `/<agent>` switchers the composer
+   * also forwards the prompt context (mentions/attachments) so the host can
+   * switch the agent and send the trailing prompt atomically without losing
+   * `@`-chips. Regular commands ignore these fields (`session.command`
+   * takes no parts).
+   */
+  | { type: "runCommand"; command: string; arguments: string; mentions?: string[]; attachments?: Attachment[]; conversationMentions?: ConversationMention[] }
   | { type: "editMessage"; id: string; text: string; mentions?: string[]; attachments?: Attachment[]; conversationMentions?: ConversationMention[] }
   /**
    * Revert the conversation to an earlier user message (per-message Undo in

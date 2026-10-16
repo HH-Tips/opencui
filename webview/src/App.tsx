@@ -513,6 +513,10 @@ export default function App() {
             contextUsage={state.contextUsage}
             commands={state.commands}
             onRunCommand={runCommandAndPinTop}
+            selection={state.selection}
+            modelCatalog={state.modelCatalog}
+            onSetAgent={setAgent}
+            onSetModel={setModel}
             inject={state.injectedText}
             injectMention={state.injectedMention}
             history={promptHistoryEntries}

@@ -36,6 +36,7 @@ import type {
   ReviewHunkState,
 } from "../protocol"
 import { BUILTIN_COMMAND_NAMES, withBuiltinCommands } from "./builtin-commands"
+import { withAgentCommands } from "./agent-commands"
 import { BuiltinRunners } from "./builtin-runners"
 import { readContextUsage } from "./context-usage"
 import { adoptStorageIDs, migrateConversationsToWorkspace } from "./conversation-store"
@@ -149,6 +150,10 @@ export class ChatView implements vscode.WebviewViewProvider {
   private contextUsageRequest = 0
   /** Names from the last `command.list` fetch — lets a custom command shadow a built-in. */
   private customCommandNames = new Set<string>()
+  /** Last custom list (pre-builtin) so agent arrivals can re-post commands without refetch. */
+  private lastCustomCommands: CommandInfo[] = []
+  /** Names currently exposed as synthesized `/<agent>` switchers. */
+  private agentCommandNames = new Set<string>()
   /**
    * Cached provider fetch backing the in-panel model picker. Refetched on
    * webview mount and on `refreshModels` (picker open); prefs changes only
@@ -511,6 +516,18 @@ export class ChatView implements vscode.WebviewViewProvider {
     if (this.catalogRefreshTimer) {
       clearTimeout(this.catalogRefreshTimer)
       this.catalogRefreshTimer = undefined
+    }
+    if (this.catalogRetryTimer) {
+      clearTimeout(this.catalogRetryTimer)
+      this.catalogRetryTimer = undefined
+    }
+    if (this.commandsRetryTimer) {
+      clearTimeout(this.commandsRetryTimer)
+      this.commandsRetryTimer = undefined
+    }
+    if (this.bootstrapRetryTimer) {
+      clearTimeout(this.bootstrapRetryTimer)
+      this.bootstrapRetryTimer = undefined
     }
     this.taskStoreUnsub?.dispose()
     this.taskStoreUnsub = undefined
@@ -1185,22 +1202,64 @@ export class ChatView implements vscode.WebviewViewProvider {
   }
 
   private postModelCatalog() {
-    if (!this.modelCatalogModels) return
+    // Post as soon as EITHER half is known: agents alone still populate the
+    // footer Agent dropdown and the `/<agent>` picker entries, so the webview
+    // must not wait for the providers fetch to succeed first. Before any
+    // fetch completed there is nothing to post.
+    if (!this.modelCatalogModels && !this.modelCatalogAgents) return
+    // Prefs reads stay defensive: unit harnesses construct ChatView with
+    // partial prefs mocks, and an agents-only post must never throw there.
+    const prefs = this.prefs
     const catalog = buildModelCatalog(
-      this.modelCatalogModels,
-      this.prefs.recentModels(),
-      (providerID, modelID) => this.prefs.variantFor(providerID, modelID),
+      this.modelCatalogModels ?? [],
+      prefs.recentModels?.() ?? [],
+      (providerID, modelID) => prefs.variantFor?.(providerID, modelID),
       this.modelCatalogAgents ?? [],
-      this.prefs.collapsedProviders(),
-      this.prefs.favoriteModels(),
+      prefs.collapsedProviders?.() ?? [],
+      prefs.favoriteModels?.() ?? [],
     )
     this.post({ type: "modelCatalog", catalog })
+    // The `/<agent>` picker entries ride on the commands push. When the
+    // agent list arrives after the commands push (parallel fetches on
+    // mount), re-post commands so the switchers appear without waiting
+    // for the next `command.list` refresh.
+    this.postCommandsWithAgents()
+  }
+
+  /** Re-post the last known command list merged with current agents. No-op until the first `command.list` fetch, and skipped when the merged list is unchanged (agents arriving late must not double the pushes of a `catalog.updated` burst, #613). */
+  private postCommandsWithAgents() {
+    if (!this.commandsPosted) return
+    const merged = withAgentCommands(
+      withBuiltinCommands(this.lastCustomCommands),
+      this.modelCatalogAgents ?? [],
+    )
+    this.agentCommandNames = new Set(
+      merged.filter((c) => c.agentSwitch).map((c) => c.name),
+    )
+    const sig = this.commandsSig(merged)
+    if (sig === this.lastPostedCommandsSig) return
+    this.lastPostedCommandsSig = sig
+    this.post({ type: "commands", commands: merged })
+  }
+
+  /** Signature of the last posted command list. The agents-arrive-late
+   * re-push (`postCommandsWithAgents`) skips identical re-posts so it never
+   * doubles the IPC traffic of a `catalog.updated` burst (#613); explicit
+   * `refreshCommands` fetches always post. */
+  private lastPostedCommandsSig?: string
+
+  private commandsSig(commands: CommandInfo[]): string {
+    return commands
+      .map((c) => `${c.name}${c.takesArguments ? "+" : ""}${c.agentSwitch ? "@" : ""}`)
+      .join("\n")
   }
 
   /**
    * Fetch the provider list and push the model catalog. The picker posts
    * `refreshModels` on every open, so concurrent calls coalesce onto one
-   * in-flight fetch instead of stacking HTTP requests.
+   * in-flight fetch instead of stacking HTTP requests. Failures schedule an
+   * autonomous retry (bounded backoff) so a slow-starting server still
+   * populates the list without requiring the user to open the picker.
    */
   private refreshModelCatalog(backend?: Backend): Promise<void> {
     if (this.modelCatalogFetch) return this.modelCatalogFetch
@@ -1228,18 +1287,50 @@ export class ChatView implements vscode.WebviewViewProvider {
         }
         if (res.error || !res.data) {
           log("model catalog: config.providers failed", res.error)
-          if (this.modelCatalogModels) this.postModelCatalog()
+          // Post whichever half arrived (usually the agents) so the footer
+          // and `/<agent>` entries appear immediately; the models half is
+          // retried below instead of waiting for a picker open.
+          this.postModelCatalog()
+          if (!this.modelCatalogModels?.length) this.scheduleCatalogRetry()
           return
         }
         this.modelCatalogModels = listModels((res.data.providers ?? []) as unknown as ProviderShape[])
         this.postModelCatalog()
+        // An empty list is NOT loaded: right after boot the server can
+        // answer with zero providers (not an error), and without a retry the
+        // pickers would sit on "default" until the user opens one — which is
+        // exactly the manual refresh this schedule replaces.
+        if (!this.modelCatalogModels.length) this.scheduleCatalogRetry()
+        else this.catalogRetryAttempts = 0
       } catch (e) {
         log("model catalog refresh failed", e)
+        this.postModelCatalog()
+        if (!this.modelCatalogModels?.length) this.scheduleCatalogRetry()
       } finally {
         this.modelCatalogFetch = undefined
       }
     })()
     return this.modelCatalogFetch
+  }
+
+  private catalogRetryTimer?: ReturnType<typeof setTimeout>
+  private catalogRetryAttempts = 0
+  private static readonly CATALOG_RETRY_DELAYS_MS = [2000, 5000, 10000, 15000]
+
+  /** Autonomous retry while the model list never loaded — no picker open needed. */
+  private scheduleCatalogRetry() {
+    if (this.catalogRetryTimer || (this.modelCatalogModels?.length ?? 0) > 0) return
+    const delay = ChatView.CATALOG_RETRY_DELAYS_MS[
+      Math.min(this.catalogRetryAttempts, ChatView.CATALOG_RETRY_DELAYS_MS.length - 1)
+    ]!
+    this.catalogRetryAttempts++
+    if (this.catalogRetryAttempts > ChatView.CATALOG_RETRY_DELAYS_MS.length) return
+    this.catalogRetryTimer = setTimeout(() => {
+      this.catalogRetryTimer = undefined
+      // A picker-open refresh may have succeeded meanwhile.
+      if ((this.modelCatalogModels?.length ?? 0) > 0) return
+      void this.refreshModelCatalog()
+    }, delay)
   }
 
   private catalogRefreshTimer?: ReturnType<typeof setTimeout>
@@ -1318,6 +1409,7 @@ export class ChatView implements vscode.WebviewViewProvider {
       const res = await activeBackend.api.command.list()
       if (res.error || !res.data) {
         log("command.list failed", res.error)
+        if (!this.commandsPosted) this.scheduleCommandsRetry()
         return
       }
       const custom: CommandInfo[] = res.data.map((c) => ({
@@ -1329,12 +1421,85 @@ export class ChatView implements vscode.WebviewViewProvider {
         takesArguments: c.template === undefined || /\$ARGUMENTS\b/.test(c.template),
       }))
       this.customCommandNames = new Set(custom.map((c) => c.name))
+      this.lastCustomCommands = custom
       // Merge opencode's built-ins (/compact, /share, …); a custom command of
       // the same name wins and is dispatched through session.command instead.
-      this.post({ type: "commands", commands: withBuiltinCommands(custom) })
+      // Then append synthesized `/<agent>` switchers for the `/` picker; a
+      // custom/built-in of the same name wins there too.
+      const merged = withAgentCommands(withBuiltinCommands(custom), this.modelCatalogAgents ?? [])
+      this.agentCommandNames = new Set(
+        merged.filter((c) => c.agentSwitch).map((c) => c.name),
+      )
+      this.commandsPosted = true
+      this.lastPostedCommandsSig = this.commandsSig(merged)
+      this.post({ type: "commands", commands: merged })
     } catch (e) {
       log("command.list refresh failed", e)
+      if (!this.commandsPosted) this.scheduleCommandsRetry()
     }
+  }
+
+  /** True once the webview received its first command list (retries stop then). */
+  private commandsPosted = false
+  private commandsRetryTimer?: ReturnType<typeof setTimeout>
+  private commandsRetryAttempts = 0
+
+  /** Autonomous retry while the `/` list never loaded — no picker open needed. */
+  private scheduleCommandsRetry() {
+    if (this.commandsRetryTimer || this.commandsPosted) return
+    const delay = ChatView.CATALOG_RETRY_DELAYS_MS[
+      Math.min(this.commandsRetryAttempts, ChatView.CATALOG_RETRY_DELAYS_MS.length - 1)
+    ]!
+    this.commandsRetryAttempts++
+    if (this.commandsRetryAttempts > ChatView.CATALOG_RETRY_DELAYS_MS.length) return
+    this.commandsRetryTimer = setTimeout(() => {
+      this.commandsRetryTimer = undefined
+      if (this.commandsPosted) return
+      void this.refreshCommands()
+    }, delay)
+  }
+
+  /**
+   * Post-mount server bootstrap: connect, then fan out the workspace-scoped
+   * pushes (commands, model catalog, sessions) autonomously so the pickers
+   * are populated without opening them. Throws when `ensure()` fails; the
+   * caller posts the disconnected state and schedules a retry.
+   */
+  private async bootstrapAfterMount() {
+    const backend = await this.servers.ensure()
+    this.post({ type: "connected", connected: true })
+    this.bootstrapRetryAttempts = 0
+    void this.refreshCommands(backend)
+    void this.refreshModelCatalog(backend)
+    void this.refreshExternalSessions(backend)
+    if (this.sessionID) void this.refreshContextUsage(backend)
+    // Heal pre-fix turns on startup too (selectConversation only runs
+    // on switches, not on the initial load).
+    if (this.sessionID) void this.backfillBackendIDs(backend)
+  }
+
+  private bootstrapRetryTimer?: ReturnType<typeof setTimeout>
+  private bootstrapRetryAttempts = 0
+
+  /** Retry a failed mount bootstrap (slow-starting server) without user input. */
+  private scheduleBootstrapRetry() {
+    if (this.bootstrapRetryTimer) return
+    const delay = ChatView.CATALOG_RETRY_DELAYS_MS[
+      Math.min(this.bootstrapRetryAttempts, ChatView.CATALOG_RETRY_DELAYS_MS.length - 1)
+    ]!
+    this.bootstrapRetryAttempts++
+    if (this.bootstrapRetryAttempts > ChatView.CATALOG_RETRY_DELAYS_MS.length) return
+    this.bootstrapRetryTimer = setTimeout(() => {
+      this.bootstrapRetryTimer = undefined
+      void (async () => {
+        try {
+          await this.bootstrapAfterMount()
+        } catch (e) {
+          this.post({ type: "connected", connected: false, error: (e as Error).message })
+          this.scheduleBootstrapRetry()
+        }
+      })()
+    }, delay)
   }
 
   private async onMessage(msg: Inbound) {
@@ -1360,17 +1525,10 @@ export class ChatView implements vscode.WebviewViewProvider {
         this.post({ type: "indexStatus", status: this.indexManager.currentStatus() })
         if (this.taskStore) this.postAgentsStatus(this.taskStore.list())
         try {
-          const backend = await this.servers.ensure()
-          this.post({ type: "connected", connected: true })
-          void this.refreshCommands(backend)
-          void this.refreshModelCatalog(backend)
-          void this.refreshExternalSessions(backend)
-          if (this.sessionID) void this.refreshContextUsage(backend)
-          // Heal pre-fix turns on startup too (selectConversation only runs
-          // on switches, not on the initial load).
-          if (this.sessionID) void this.backfillBackendIDs(backend)
+          await this.bootstrapAfterMount()
         } catch (e) {
           this.post({ type: "connected", connected: false, error: (e as Error).message })
+          this.scheduleBootstrapRetry()
         }
         return
       }
@@ -1379,7 +1537,7 @@ export class ChatView implements vscode.WebviewViewProvider {
         await this.handleSend(msg.text, msg.mentions, msg.attachments, msg.conversationMentions)
         return
       case "runCommand":
-        await this.handleRunCommand(msg.command, msg.arguments)
+        await this.handleRunCommand(msg.command, msg.arguments, msg.mentions, msg.attachments, msg.conversationMentions)
         return
       case "editMessage":
         await this.handleEdit(msg.id, msg.text, msg.mentions, msg.attachments, msg.conversationMentions)
@@ -2042,11 +2200,22 @@ export class ChatView implements vscode.WebviewViewProvider {
    * server expands the command's own template (including its `!shell` / `@file`
    * substitutions) and runs the turn. The existing SSE subscription renders it.
    */
-  private async handleRunCommand(command: string, args: string) {
+  private async handleRunCommand(command: string, args: string, mentions?: string[], attachments?: Attachment[], conversationMentions?: ConversationMention[]) {
     // A built-in (/compact, /share, …) maps to a dedicated session endpoint,
     // not session.command — unless a custom command of the same name shadows it.
     if (!this.customCommandNames.has(command) && BUILTIN_COMMAND_NAMES.has(command)) {
       await this.handleBuiltinCommand(command)
+      return
+    }
+    // Fallback router for synthesized `/<agent>`: the webview normally
+    // intercepts these locally (switch + normal send, preserving @-mentions
+    // and queueing), but a stale webview catalog can still route one here.
+    // Custom commands shadow same-named agents, so check customs first above.
+    if (this.agentCommandNames.has(command)) {
+      await this.prefs.setAgent(command)
+      const prompt = args.trim()
+      if (!prompt) return
+      await this.handleSend(prompt, mentions, attachments, conversationMentions)
       return
     }
     this.turnActive = true
@@ -2602,9 +2771,11 @@ export class ChatView implements vscode.WebviewViewProvider {
     } catch {
       // error already surfaced via handler
     }
-    // Refresh the command list on every (re)connect — picks up newly-added
-    // command files and survives an opencode server restart.
+    // Refresh the command list + model catalog on every (re)connect — picks
+    // up newly-added command files and survives an opencode server restart
+    // without requiring a picker open.
     void this.refreshCommands(backend)
+    void this.refreshModelCatalog(backend)
   }
 
   private ensureWebviewID(opencodeID: string): string {

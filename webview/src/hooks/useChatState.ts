@@ -579,8 +579,8 @@ export function useChatState() {
     unqueueMessage(id: string) {
       dispatch({ type: "unqueueMessage", id })
     },
-    runCommand(command: string, args: string) {
-      vscode.post({ type: "runCommand", command, arguments: args })
+    runCommand(command: string, args: string, mentions?: string[], attachments?: Attachment[], conversationMentions?: ConversationMention[]) {
+      vscode.post({ type: "runCommand", command, arguments: args, mentions, attachments, conversationMentions })
     },
     editMessage(id: string, text: string, mentions?: string[], attachments?: Attachment[], conversationMentions?: ConversationMention[]) {
       vscode.post({ type: "editMessage", id, text, mentions, attachments, conversationMentions })

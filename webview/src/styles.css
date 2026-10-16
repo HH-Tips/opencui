@@ -2829,6 +2829,133 @@ button:focus-visible {
 }
 .promptbox-row .spacer { flex: 1; }
 
+/* Footer Agent/Effort selectors: compact triggers sitting next to the
+   context ring so agent + effort stay at hand without opening the header
+   picker. Two separate dropdowns (Agent, Effort) reading the same
+   `selection` as the header, so top and bottom sync by construction. */
+.promptbox-footer-select {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.footer-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 140px;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.footer-select-trigger:hover,
+.footer-select-trigger.is-open {
+  background: var(--hover-bg-pill);
+  color: var(--vscode-foreground);
+}
+.footer-select-trigger:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.footer-select-trigger:disabled:hover {
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+}
+.footer-select-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+.footer-select-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+.footer-select-trigger .codicon {
+  flex: 0 0 auto;
+  font-size: 12px;
+  opacity: 0.7;
+}
+.promptbox-footer-popover {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 6px);
+  z-index: var(--z-popover);
+  min-width: 160px;
+  max-width: min(260px, calc(100vw - 40px));
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+  border-radius: var(--radius);
+  background: var(--vscode-dropdown-background, var(--vscode-sideBar-background));
+  box-shadow: var(--shadow-popover);
+  animation: popover-in 0.12s ease-out;
+  --popover-from: 4px;
+}
+.footer-select-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.footer-select-option:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+.footer-select-option.is-disabled,
+.footer-select-option:disabled {
+  opacity: 0.65;
+  cursor: default;
+}
+.footer-select-option.is-disabled:hover {
+  background: transparent;
+}
+.footer-select-option.is-current .footer-select-option-name {
+  font-weight: 600;
+}
+.footer-select-check {
+  flex: 0 0 auto;
+  display: inline-flex;
+  justify-content: center;
+  width: 14px;
+}
+.footer-select-check .codicon-check {
+  font-size: 14px;
+  color: var(--vscode-textLink-foreground);
+}
+.footer-select-option-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  .promptbox-footer-popover {
+    animation: none;
+  }
+}
+
 .context-usage {
   --context-usage-color: var(--vscode-progressBar-background, var(--vscode-focusBorder));
   --context-usage-track: var(--vscode-editorWidget-border, rgba(128, 128, 128, 0.35));
