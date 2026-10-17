@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A question with options and a free-text answer could not be answered by hand. The options were radio buttons that could not be deselected, and the typed answer was appended after the chosen label, so the backend read only the label and dropped what had been typed. A single-select question now offers "Other…" as one of its radios: picking it moves the caret into the answer field and sends only the typed text, and picking a real option sends only that label. The text is kept while an option is checked and comes back with "Other…". Multi-select questions are unchanged, since labels and free text coexist there.
+
 ## [1.17.0] - 2026-10-15
 
 ### Added
