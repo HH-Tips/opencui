@@ -9,6 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A question with options and a free-text answer could not be answered by hand. The options were radio buttons that could not be deselected, and the typed answer was appended after the chosen label, so the backend read only the label and dropped what had been typed. A single-select question now offers "Other…" as one of its radios: picking it moves the caret into the answer field and sends only the typed text, and picking a real option sends only that label. The text is kept while an option is checked and comes back with "Other…". Multi-select questions are unchanged, since labels and free text coexist there.
+- The dot in a checked question radio sat off-center inside its circle. It was the `●` text glyph, whose ink rests on the font's baseline and shifts with whichever fallback font renders it, so it read as scaled or mispositioned. The dot is drawn in CSS now and is exactly centered in every theme and platform.
 
 ## [1.17.0] - 2026-10-15
 
